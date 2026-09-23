@@ -1,0 +1,19 @@
+{
+  "current_app": "dmm6500",
+  "apps": [
+    {
+      "id": "dmm6500",
+      "name": "DMM6500 综合监控台",
+      "key_prefix": "DMM6500-",
+      "contact_email": "792789598@qq.com",
+      "contact_extra": "微信 / QQ：得鹿梦鱼"
+    },
+    {
+      "id": "test_target",
+      "name": "测试工具",
+      "key_prefix": "TEST-",
+      "contact_email": "792789598@qq.com",
+      "contact_extra": "微信 / QQ：得鹿梦鱼"
+    }
+  ]
+}
