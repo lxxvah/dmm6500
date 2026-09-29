@@ -615,6 +615,7 @@ class WaveformWidget(QWidget):
     alarm_triggered = pyqtSignal(str, float)
     save_data_requested = pyqtSignal()
     about_requested = pyqtSignal()
+    gauge_toggled = pyqtSignal(bool)
 
     MENU_CONFIG = [
         ("reset",      "复位",           True),
@@ -622,6 +623,7 @@ class WaveformWidget(QWidget):
         ("cursor",     "游标",           True),
         ("grid",       "网格",           False),
         ("crosshair",  "十字线",         False),
+        ("gauge",      "机械表",         False),
         ("save_img",   "保存图形",       False),
         ("save_data",  "保存数据",       False),
         ("y_center",   "Y轴自动居中",    True),
@@ -921,10 +923,13 @@ class WaveformWidget(QWidget):
         for key, _, _ in self.MENU_CONFIG:
             self._menu_visible[key] = checked
         self._apply_menu_visibility()
+        self.gauge_toggled.emit(checked)
 
     def _action_toggle_menu(self, key: str, checked: bool):
         self._menu_visible[key] = checked
         self._apply_menu_visibility()
+        if key == "gauge":                           # ★ 新增
+            self.gauge_toggled.emit(checked)
 
     def _context_menu_qss(self) -> str:
         t = THEMES.get(self.theme, THEMES['light'])

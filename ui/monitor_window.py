@@ -4,10 +4,16 @@
 ui/monitor_window.py —— DMM6500 监控主窗口
 =============================================
 状态文本全部 ≤3 字，彻底消除状态栏宽度抖动
+
+【机械表设计】
+  · 表盘单位/量程 完全跟随实时值卡片（复用 format_with_unit 的前缀逻辑）
+  · 档位用 1/2/5/10 系，滞回 + 冷却防抖
+  · 双极：V/A/Ω（±tier）；单极：其余（0~tier）
 """
 
 import time
 import csv
+from dataclasses import replace
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -32,12 +38,35 @@ from core.recorder import DataRecorder
 from core.alarm import AlarmManager
 from core.report import ReportBuilder
 from core.buffer_downloader import BufferDownloader, BufferDownloadWorker
+from core.gauge_range import GaugeRangeController, GaugeRangeDecision
 
 from libs.platform_utils import apply_titlebar_theme
+
+from libs.analog_gauge_qt import (
+    AnalogGauge, GaugeConfig, GAUGE_PRESETS,
+    ThemeManager as GaugeThemeManager,
+    palette_from_theme,
+)
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+_GAUGE_TITLE = {
+    "DCV":   "VOLTAGE",
+    "DCI":   "CURRENT",
+    "ACV":   "AC VOLTAGE",
+    "ACI":   "AC CURRENT",
+    "RES2W": "RESISTANCE",
+    "RES4W": "RESISTANCE 4W",
+    "CAP":   "CAPACITANCE",
+    "FREQ":  "FREQUENCY",
+    "PER":   "PERIOD",
+    "TEMP":  "TEMPERATURE",
+    "CONT":  "CONTINUITY",
+    "DIOD":  "DIODE",
+}
 
 
 class DMM6500Monitor(QMainWindow):
@@ -65,13 +94,17 @@ class DMM6500Monitor(QMainWindow):
         self._paused = False
         self.curve_id = None
 
+        # 机械表：更新节流 + 档位控制器
+        self._gauge_last_ts = 0.0
+        self.gauge_range = GaugeRangeController()
+
         self._init_ui()
 
-        # ✅ 首次显示：缓存为空，会真正应用一次
         apply_titlebar_theme(self, self.theme.is_dark)
 
         self.panel.set_mode_list(list_modes())
         self._apply_mode_to_waveform()
+        self._apply_mode_to_gauge(self.panel.current_mode)
 
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.waveform.refresh)
@@ -122,8 +155,8 @@ class DMM6500Monitor(QMainWindow):
         self.curve_id = self.waveform.add_curve("曲线1",
                                                  color=COLORS.ACCENT_PURPLE)
         self.waveform.save_data_requested.connect(self.export_full_data)
-        # ✅ 新增：右键菜单"功能介绍" → 打开 AboutDialog
         self.waveform.about_requested.connect(self.show_about_dialog)
+        self.waveform.gauge_toggled.connect(self._on_gauge_toggled)
         right_layout.addWidget(self.waveform, stretch=1)
 
         main.addWidget(right_panel, stretch=1)
@@ -131,12 +164,82 @@ class DMM6500Monitor(QMainWindow):
         self.setStyleSheet(self.theme.app_qss())
         self.waveform.reapply_toolbar_style()
 
+    # ============================================
+    # 机械表
+    # ============================================
     def _apply_mode_to_waveform(self):
         meta = get_mode_info(self.panel.current_mode)
         self.waveform.set_y_label(meta.y_label, meta.unit)
 
+    def _on_gauge_toggled(self, show: bool):
+        log(f"[机械表] 右键菜单切换: visible={show}")
+        self.panel.set_gauge_visible(show)
+
+    def _apply_mode_to_gauge(self, mode: str):
+        """模式切换 → 用默认单位初始化表盘"""
+        try:
+            base_unit = get_mode_info(mode).unit
+            decision = self.gauge_range.get_initial_decision(mode, base_unit)
+            cfg = self.panel.gauge.config()
+            new_cfg = replace(
+                cfg,
+                title=_GAUGE_TITLE.get(mode, mode),
+                unit=decision.unit,
+                min_value=decision.min_value,
+                max_value=decision.max_value,
+                major_step=decision.major_step,
+                minor_step=decision.minor_step,
+                decimals=decision.decimals,
+                value_position=cfg.value_position,
+            )
+            self.panel.gauge.set_config(new_cfg)
+            self.panel.gauge.set_value(0.0, animate=False)
+            log(f"[机械表] 模式 {mode} → "
+                f"[{decision.min_value}, {decision.max_value}] "
+                f"{decision.unit}")
+        except Exception as e:
+            log(f"[机械表] 应用模式失败: {e}")
+
+    def _set_gauge_range(self, decision: GaugeRangeDecision) -> bool:
+        """同步表盘量程 + 单位；返回 True 表示档位实际变了"""
+        cfg = self.panel.gauge.config()
+        if (abs(cfg.min_value - decision.min_value) < 1e-12
+                and abs(cfg.max_value - decision.max_value) < 1e-12
+                and cfg.unit == decision.unit):
+            return False
+        new_cfg = replace(
+            cfg,
+            unit=decision.unit,
+            min_value=decision.min_value,
+            max_value=decision.max_value,
+            major_step=decision.major_step,
+            minor_step=decision.minor_step,
+            decimals=decision.decimals,
+        )
+        self.panel.gauge.set_config(new_cfg)
+        return True
+
+    def _update_gauge(self, value: float):
+        """每来一个数据点（10Hz 节流后）调用"""
+        try:
+            mode = self.panel.current_mode
+            base_unit = get_mode_info(mode).unit
+            # ★ 关键：3 参数调用
+            decision = self.gauge_range.update(mode, value, base_unit)
+            changed = self._set_gauge_range(decision)
+            # ★ 关键：把原始值换算成"该单位下的显示值"
+            disp_value = (value / decision.unit_scale
+                          if decision.unit_scale else value)
+            self.panel.gauge.set_value(disp_value, animate=not changed)
+        except Exception as e:
+            log(f"[机械表] 更新失败: {e}")
+
+    def _on_range_updated(self, mode: str, range_val: float):
+        """不再跟随仪器档位——保留空实现以兼容信号连接"""
+        pass
+
     # ============================================
-    # ✅ 修复 #2：连接中切换模式时回退组合框
+    # 模式切换
     # ============================================
     def on_mode_changed(self, mode: str):
         if self.worker and self.worker.isRunning():
@@ -156,6 +259,7 @@ class DMM6500Monitor(QMainWindow):
         self._disconnect_time = None
         self._reset_ui_only()
         self._apply_mode_to_waveform()
+        self._apply_mode_to_gauge(mode)
         self.panel.set_status("已切换", "info")
 
     def _reset_ui_only(self):
@@ -167,12 +271,15 @@ class DMM6500Monitor(QMainWindow):
         self.card_min.update_value("---")
         self.card_avg.update_value("---")
         self.card_std.update_value("---")
+        try:
+            self.panel.gauge.set_value(0.0, animate=False)
+        except Exception:
+            pass
 
     # ============================================
     # 功能介绍
     # ============================================
     def show_about_dialog(self):
-        """右键菜单 → 功能介绍"""
         try:
             show_about(self, self.theme)
         except Exception as e:
@@ -244,6 +351,7 @@ class DMM6500Monitor(QMainWindow):
             self.report_builder.set_alarm_log(self.alarm.log_file)
 
         self._apply_mode_to_waveform()
+        self._apply_mode_to_gauge(cfg["mode"])
 
         self._paused = False
         self.panel.set_pause_btn_checked(False)
@@ -256,6 +364,7 @@ class DMM6500Monitor(QMainWindow):
         self.worker.connected_info.connect(self._on_connected)
         self.worker.status_update.connect(self._on_status_update)
         self.worker.instrument_error.connect(self._on_instrument_error)
+        self.worker.range_updated.connect(self._on_range_updated)
         self.worker.start()
 
     def stop_measurement(self):
@@ -342,6 +451,7 @@ class DMM6500Monitor(QMainWindow):
         if self._paused:
             return
 
+        # 实时值卡片（已有）
         s, u = format_with_unit(value, base_unit)
         self.realtime_card.update_value(s, u)
 
@@ -356,6 +466,13 @@ class DMM6500Monitor(QMainWindow):
         ]:
             s, u = format_with_unit(v, base_unit)
             card.update_value(s, u)
+
+        # ★ 机械表：10Hz 节流
+        if self.panel.gauge_wrap.isVisible():
+            now = time.monotonic()
+            if now - self._gauge_last_ts >= 0.1:
+                self._gauge_last_ts = now
+                self._update_gauge(value)
 
     # ============================================
     # 数据记录
@@ -608,6 +725,7 @@ class DMM6500Monitor(QMainWindow):
         self.worker.connected_info.connect(self._on_connected)
         self.worker.status_update.connect(self._on_status_update)
         self.worker.instrument_error.connect(self._on_instrument_error)
+        self.worker.range_updated.connect(self._on_range_updated)
         self.worker.start()
 
         self.panel.set_connected_state(True)
@@ -629,7 +747,6 @@ class DMM6500Monitor(QMainWindow):
     # ============================================
     def switch_theme(self, mode: str):
         self.theme = Theme(mode)
-        # ✅ 缓存自动检测到 is_dark 变化 → 重新应用
         apply_titlebar_theme(self, self.theme.is_dark)
         self.setStyleSheet(self.theme.app_qss())
         self.panel.switch_theme(self.theme)
@@ -643,7 +760,11 @@ class DMM6500Monitor(QMainWindow):
         self.waveform.set_theme(mode)
         self.waveform.reapply_toolbar_style()
 
-        # ✅ 图标模块引用：DMM6500app_icon
+        try:
+            GaugeThemeManager.instance().set_theme(mode)
+        except Exception as e:
+            print(f"[机械表] 主题切换失败: {e}")
+
         try:
             from libs.DMM6500app_icon import get_icon_manager
             get_icon_manager().set_theme(mode)
@@ -662,7 +783,6 @@ class DMM6500Monitor(QMainWindow):
         if self.recorder.is_recording:
             self.recorder.stop()
 
-        # ✅ 图标模块引用：DMM6500app_icon
         try:
             from libs.DMM6500app_icon import get_icon_manager
             get_icon_manager().detach(self)

@@ -61,6 +61,22 @@ MODE_REGISTRY = {
 }
 
 
+# ★ 各模式的量程查询 SCPI（没有量程概念的模式不出现在这里）
+_RANGE_QUERY = {
+    "DCV":   "SENS:VOLT:DC:RANG?",
+    "DCI":   "SENS:CURR:DC:RANG?",
+    "RES2W": "SENS:RES:RANG?",
+    "RES4W": "SENS:FRES:RANG?",
+    "ACV":   "SENS:VOLT:AC:RANG?",
+    "ACI":   "SENS:CURR:AC:RANG?",
+    "CAP":   "SENS:CAP:RANG?",
+    "FREQ":  "SENS:FREQ:THR:VOLT:RANG?",
+    "PER":   "SENS:PER:THR:VOLT:RANG?",
+    "CONT":  "SENS:CONT:RANG?",
+    # TEMP / DIOD 无量程
+}
+
+
 def get_mode_info(mode: str) -> ModeInfo:
     if mode not in MODE_REGISTRY:
         raise ValueError(f"未知测量功能: {mode}")
@@ -77,18 +93,16 @@ class MeasurementWorker(QThread):
     connected_info   = pyqtSignal(str)
     status_update    = pyqtSignal(str)
     instrument_error = pyqtSignal(str)
+    range_updated    = pyqtSignal(str, float)   # ★ 新增 (mode, range)
 
     def __init__(self, ip_address: str, config: dict, interval_ms: int = 200):
         super().__init__()
-        # ip_address 字段复用：既可能是 "192.168.x.x"，也可能是
-        # "USB0::0x05E6::0x6500::xxxx::INSTR" 之类的 VISA 地址
         self.ip_address = ip_address
         self.config = config
         self.interval_ms = interval_ms
         self.running = False
         self.conn: Optional[ConnectionManager] = None
 
-    # ✅ 修复 #5：自动区分 IP / VISA 地址
     def _connect(self):
         self.conn = ConnectionManager()
         addr = self.ip_address or ""
@@ -115,6 +129,17 @@ class MeasurementWorker(QThread):
                 self.instrument_error.emit(err)
         except Exception:
             pass
+
+    def _query_range(self, inst) -> Optional[float]:
+        """查询当前模式的量程；无量程或不支持时返回 None"""
+        cmd = _RANGE_QUERY.get(self.config["mode"])
+        if not cmd:
+            return None
+        try:
+            v = float(inst.query(cmd).strip())
+            return v if v > 0 else None
+        except Exception:
+            return None
 
     def _apply_config(self, inst):
         cfg = self.config
@@ -171,6 +196,11 @@ class MeasurementWorker(QThread):
             self.status_update.emit("配置中")
             self._apply_config(inst)
 
+            # ★ 新增：配置后查一次量程通知主窗口
+            rv = self._query_range(inst)
+            if rv is not None:
+                self.range_updated.emit(self.config["mode"], rv)
+
             try:
                 while True:
                     e = inst.query("SYST:ERR?").strip()
@@ -194,6 +224,13 @@ class MeasurementWorker(QThread):
                     if count % 10 == 0:
                         log(f"[后台] 已读取 {count} 个，最新: {val_str}")
                         self._check_instrument_error(inst)
+
+                    # ★ 新增：每 50 点刷一次量程（跟随自动量程）
+                    if count % 50 == 0:
+                        rv = self._query_range(inst)
+                        if rv is not None:
+                            self.range_updated.emit(self.config["mode"], rv)
+
                 except Exception as e:
                     error_count += 1
                     log(f"[读取错误 #{error_count}] {e}")

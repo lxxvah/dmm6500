@@ -13,6 +13,7 @@ from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 
 from theme import Theme, COLORS
 from ui.cards import ToggleSwitch
+from libs.analog_gauge_qt import AnalogGauge, GaugeConfig, GAUGE_PRESETS
 
 
 class SearchButton(QPushButton):
@@ -116,7 +117,6 @@ class ControlPanel(QWidget):
         self._init_ui()
         self._apply_styles()
 
-        # ✅ 修复 #4：初始状态只在创建时设置一次，不再放进 _apply_styles
         self.set_status("未连接", "normal")
 
     def _init_ui(self):
@@ -265,7 +265,35 @@ class ControlPanel(QWidget):
         data_group.layout().addLayout(data_vbox)
         layout.addWidget(data_group)
 
-        layout.addStretch()
+        # ---------- 机械表容器 ----------
+        # ★ 关键：先 gauge_wrap，再 layout.addStretch()——顺序和原代码一致
+        #    隐藏时：data_group + (隐藏 widget 不占位) + addStretch() → 100% 等同原 UI
+        #    显示时：data_group + 表盘 + addStretch() → 表盘在数据分组下方
+        self.gauge_wrap = QWidget(self)
+        self.gauge_wrap.setObjectName("gauge_wrap")
+        gw_layout = QVBoxLayout(self.gauge_wrap)
+        gw_layout.setContentsMargins(0, 8, 0, 6)
+        gw_layout.setSpacing(0)
+
+        gw_layout.addStretch(1)
+
+        self.gauge = AnalogGauge(
+            self.gauge_wrap,
+            width=220, height=220,          # ★ 表盘尺寸
+            preset="voltage_v",
+            value_position="left",         # ★ below / left / right / center
+        )
+        gw_layout.addWidget(self.gauge,
+                            alignment=Qt.AlignmentFlag.AlignCenter)
+
+        gw_layout.addStretch(1)
+
+        layout.addStretch(1)
+        layout.addWidget(self.gauge_wrap)   # ★ 不带 stretch
+        layout.addStretch(2)                 # ★ 原封不动保留
+
+        # 默认隐藏
+        self.gauge_wrap.setVisible(False)
 
     def _make_group(self, title):
         g = QGroupBox(title)
@@ -297,8 +325,6 @@ class ControlPanel(QWidget):
         for g in self.findChildren(QGroupBox):
             g.setStyleSheet(t.group_box_qss())
 
-        # ✅ 修复 #4：主题切换时只刷新状态徽章样式，保留当前文本
-        #            不再强制重置为"未连接"
         kind = self._last_status_kind if self._last_status_kind is not None else 'normal'
         self.status_label.setStyleSheet(self.theme.status_badge_qss(kind))
 
@@ -424,11 +450,20 @@ class ControlPanel(QWidget):
             self.mode_combo.setCurrentText(current)
         self.mode_combo.blockSignals(False)
 
-    # ✅ 新增：供 monitor_window 在非法切换时回退
     def set_mode_silently(self, mode: str):
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentText(mode)
         self.mode_combo.blockSignals(False)
+
+    # ★ 强化显隐：显式触发 layout 重算
+    def set_gauge_visible(self, visible: bool) -> None:
+        print(f"[面板] set_gauge_visible({visible})", flush=True)
+        self.gauge_wrap.setVisible(visible)
+        if visible:
+            self.gauge_wrap.raise_()
+            self.gauge_wrap.updateGeometry()
+            self.updateGeometry()
+            self.gauge.update()
 
     def switch_theme(self, theme: Theme):
         self.theme = theme

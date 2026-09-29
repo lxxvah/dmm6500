@@ -9,6 +9,7 @@ main.py —— 程序入口
   · 创建主窗口 DMM6500Monitor
   · 全局快捷键 Ctrl+T 循环切换主题
   · 图标由 libs/DMM6500app_icon.py 管理（跟随主题）
+  · 机械表色板桥接（libs/analog_gauge_qt.py 跟随主题）
 
 命令行参数：
   --dark              使用深色主题启动
@@ -33,6 +34,19 @@ except Exception as _e:
     print(f"[图标] 模块加载失败: {_e}")
     get_icon_manager = None
     HAS_APP_ICON = False
+
+# 机械表色板桥接（失败时优雅降级，不影响主功能）
+try:
+    from libs.analog_gauge_qt import (
+        ThemeManager as GaugeThemeManager,
+        palette_from_theme,
+    )
+    HAS_GAUGE = True
+except Exception as _e:
+    print(f"[机械表] 模块加载失败: {_e}")
+    GaugeThemeManager = None
+    palette_from_theme = None
+    HAS_GAUGE = False
 
 
 def parse_args():
@@ -82,6 +96,16 @@ def main():
             mgr.set_application_icon(initial_mode)
         except Exception as e:
             print(f"[图标] 应用级图标设置失败: {e}")
+
+    # 机械表：注册主题色板桥接（全局一次）
+    if HAS_GAUGE:
+        try:
+            GaugeThemeManager.instance().set_palette_provider(
+                lambda name: palette_from_theme(Theme(name))
+            )
+            GaugeThemeManager.instance().set_theme(initial_mode)
+        except Exception as e:
+            print(f"[机械表] 色板桥接注册失败: {e}")
 
     # 授权校验
     from licensing import ensure_licensed
